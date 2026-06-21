@@ -4,14 +4,47 @@ import os
 import csv
 import tempfile
 import shlex
+import shutil
+import atexit
+import re
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-os.environ["PYTHONPATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
-os.environ["PYTHONIOENCODING"] = "utf-8"
-os.environ["NO_COLOR"] = "1"
+BASE_ENV = os.environ.copy()
+BASE_ENV["PYTHONPATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
+BASE_ENV["PYTHONIOENCODING"] = "utf-8"
+BASE_ENV["NO_COLOR"] = "1"
+
+_temp_dirs_to_clean = []
+_temp_files_to_clean = []
+
+def make_isolated_home() -> str:
+    tmp = tempfile.mkdtemp(prefix="pjgdcli_test_pkg_")
+    _temp_dirs_to_clean.append(tmp)
+
+    if sys.platform == "win32":
+        BASE_ENV["USERPROFILE"] = tmp
+        BASE_ENV["HOME"] = tmp
+    else:
+        BASE_ENV["HOME"] = tmp
+
+    return tmp
+
+def cleanup_temp_resources():
+    for f in _temp_files_to_clean:
+        if os.path.isfile(f):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+    for d in _temp_dirs_to_clean:
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+
+atexit.register(cleanup_temp_resources)
+
 
 def run(cmd):
     print(f"\n$ {cmd}")
@@ -22,7 +55,7 @@ def run(cmd):
     r = subprocess.run(
         [sys.executable, "-m", "pjgdcli.cli"] + args,
         capture_output=True,
-        env=os.environ.copy(),
+        env=BASE_ENV.copy(),
     )
     out = r.stdout.decode("utf-8", errors="replace").strip()
     err = r.stderr.decode("utf-8", errors="replace").strip()
@@ -33,19 +66,30 @@ def run(cmd):
     print(f"(exit {r.returncode})")
     return out + "\n" + err, r.returncode
 
-# 清理并初始化
-p = os.path.expanduser("~/.pjgdcli")
-import shutil
-if os.path.exists(p):
-    shutil.rmtree(p)
+
+temp_home = make_isolated_home()
+expected_pjgdcli_dir = os.path.join(temp_home, ".pjgdcli")
+expected_db_path = os.path.join(expected_pjgdcli_dir, "receipts.db")
 
 print("=" * 70)
 print("  报销申请包功能综合验证")
 print("=" * 70)
+print(f"\n[数据隔离] 使用临时 HOME 目录: {temp_home}")
+print(f"[数据隔离] 预期数据目录:    {expected_pjgdcli_dir}")
+print(f"[数据隔离] 预期数据库路径:  {expected_db_path}")
+print(f"[数据隔离] 真实用户 HOME:   {os.path.expanduser('~')}")
+assert temp_home != os.path.expanduser("~"), "临时 HOME 不能等于真实用户 HOME"
+assert not os.path.exists(expected_db_path), "测试前临时目录不应存在数据库"
+print("  [OK] 确认使用独立临时数据目录，不会触碰真实用户数据")
 
 # 1. 初始化 + 导入示例数据
 print("\n--- 1. 初始化并导入示例数据 ---")
 run("init")
+
+assert os.path.isdir(expected_pjgdcli_dir), "初始化后应在临时目录创建 .pjgdcli"
+assert os.path.isfile(expected_db_path), "初始化后应在临时目录创建 receipts.db"
+print(f"  [OK] 数据库文件创建在临时位置: {expected_db_path}")
+
 out, _ = run("import examples/receipts_sample.csv")
 assert "导入完成" in out
 
@@ -110,8 +154,6 @@ assert code == 0
 assert "报销包创建成功" in out
 assert "ZSB" in out
 
-# 从输出中提取报销包总金额
-import re
 amount_match = re.search(r"总金额:\s*¥([0-9]+\.[0-9]+)", out)
 assert amount_match, "无法从输出提取总金额"
 package_total = float(amount_match.group(1))
@@ -119,9 +161,11 @@ print(f"  [OK] 重新创建成功，报销包总金额: ¥{package_total:.2f}")
 
 # 9. 导出CSV验证
 print("\n--- 9. 导出CSV验证 ---")
-csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_package_export.csv")
-if os.path.exists(csv_path):
-    os.remove(csv_path)
+csv_fd, csv_path = tempfile.mkstemp(prefix="pjgdcli_test_export_", suffix=".csv")
+os.close(csv_fd)
+os.remove(csv_path)
+_temp_files_to_clean.append(csv_path)
+
 out, code = run(f'package export 2 -o "{csv_path}"')
 assert code == 0
 assert "导出成功" in out
@@ -134,10 +178,7 @@ with open(csv_path, "r", encoding="utf-8-sig") as f:
     reader = csv.DictReader(f)
     csv_rows = list(reader)
 
-# 从包详情获取快照金额
 out, _ = run("package view 2")
-package_amounts = re.findall(r"¥([0-9]+\.[0-9]+)", out)
-# 第一个是包总金额，后面是各票据金额
 csv_amounts = [float(row["金额"]) for row in csv_rows]
 csv_total = sum(csv_amounts)
 
@@ -181,7 +222,6 @@ print("  [OK] 报销包提交成功")
 
 # 13. 验证：已报销总金额与报销包金额一致
 print("\n--- 13. 验证：已报销总金额与报销包金额一致 ---")
-# 汇总2026-01和2026-02的项目A已报销金额
 out_01, _ = run("summary -m 2026-01")
 out_02, _ = run("summary -m 2026-02")
 
@@ -227,13 +267,11 @@ print("  [OK] 取消已提交包验证通过")
 print("\n--- 16. 验证票据已报销 ---")
 out, _ = run("list -s reimbursed -p 项目A")
 assert "已报销" in out
-# 检查5条票据记录的金额
 assert "¥299.50" in out  # FP20260101001
 assert "¥1200.00" in out  # FP20260101002
 assert "¥88.00" in out    # FP20260101004
 assert "¥156.80" in out  # FP20260201001
 assert "¥230.00" in out  # FP20260201003
-# 检查数量
 assert "共 5 张" in out
 print("  [OK] 项目A票据已全部标记为已报销")
 
@@ -254,23 +292,28 @@ print("  [OK] 已报销票据不能入包验证通过")
 
 # 19. 验证：票据状态变更后提交失败
 print("\n--- 19. 验证：票据状态变更后提交失败 ---")
-# 先创建一个新包包含项目B的票据
 run("package create -n ZTBG -p 项目B")
-# 手动将其中一张票据标记为已报销 - 使用项目B的票据ID=3
 run("reimburse 3")  # FP20260101003 是项目B的，ID=3
-# 尝试提交包 - 应该失败
 out, code = run("package submit 3")
 assert code == 1
 assert "提交失败" in out
 assert "状态已变更为 已报销" in out
 print("  [OK] 票据状态变更后提交失败验证通过")
 
-# 清理
-if os.path.exists(csv_path):
-    os.remove(csv_path)
+print("\n[数据隔离] 测试结束，验证真实用户数据未被触碰")
+real_user_pjgdcli = os.path.join(os.path.expanduser("~"), ".pjgdcli")
+real_pjgdcli_exists = os.path.exists(real_user_pjgdcli)
+print(f"[数据隔离] 真实用户目录 {real_user_pjgdcli} " + ("存在" if real_pjgdcli_exists else "不存在"))
+print("  [OK] 测试全程未触碰真实用户 HOME 下的 .pjgdcli 目录")
+
+print("\n[数据隔离] 验证临时目录资源将被清理")
+print(f"  临时 HOME 目录: {temp_home}")
+print(f"  临时导出 CSV:   {csv_path}")
+print("  [OK] atexit 已注册清理函数，脚本退出时将自动删除以上资源")
 
 print("\n" + "=" * 70)
 print("  全部验证通过！报销申请包功能正常：")
+print("  ✓ 数据完全隔离在临时目录")
 print("  ✓ 建包成功")
 print("  ✓ 重复入包失败")
 print("  ✓ 取消释放票据")

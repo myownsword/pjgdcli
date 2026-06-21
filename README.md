@@ -199,6 +199,31 @@ pjgdcli batches -f
 
 异常批次会高亮显示，并列出前 10 条失败明细，完整报告可查看对应路径。
 
+## 自动化测试脚本（数据安全）
+
+所有测试脚本均使用**独立临时 HOME 目录**运行，绝不会触碰真实用户的 `~/.pjgdcli` 数据目录。
+测试通过 `tempfile.mkdtemp()` 创建隔离环境，通过 `atexit` 注册清理函数在脚本退出时自动删除临时资源。
+
+| 脚本 | 验证内容 | 运行方式 |
+|---|---|---|
+| `run_tests.py` | 基础功能：增删改查、导入、汇总、标签、批次 | `python run_tests.py` |
+| `test_undo.py` | 撤销功能：单次/多次撤销行为正确性 | `python test_undo.py` |
+| `test_package.py` | 报销申请包：建包/重复入包/取消/提交/导出/状态漂移 | `python test_package.py` |
+
+每个脚本运行时会打印：
+```
+[数据隔离] 使用临时 HOME 目录: C:\WINDOWS\TEMP\pjgdcli_test_xxx
+[数据隔离] 预期数据目录:    C:\WINDOWS\TEMP\pjgdcli_test_xxx\.pjgdcli
+[数据隔离] 真实用户 HOME:   C:\Users\yourname
+  [OK] 确认使用独立临时数据目录，不会触碰真实用户数据
+```
+
+测试结束时会输出：
+```
+[数据隔离] 真实用户目录 C:\Users\yourname\.pjgdcli 存在
+  [OK] 测试全程未触碰真实用户 HOME 下的 .pjgdcli 目录
+```
+
 ## 快速验证（必跑示例）
 
 ```bash
@@ -247,6 +272,7 @@ pjgdcli batches -f
 
 ### 状态流转
 
+#### 票据状态
 ```
 unreimbursed (默认) <-> reimbursed
          ↑              ↑
@@ -254,3 +280,17 @@ unreimbursed (默认) <-> reimbursed
 ```
 
 每次 `reimburse`/`unreimburse`/`undo` 都会在 `status_history` 写入一条记录，保证可追溯。
+
+#### 报销包状态
+```
+pending (待提交) ── submit ──> submitted (已提交)
+     │                          (终态，不可取消/重新提交)
+     └── cancel ──> cancelled (已取消)
+                    (终态，票据释放可重新入包)
+```
+
+**业务规则：**
+- 一张票据只能同时存在于一个 `pending` 状态的报销包中
+- 已报销（`reimbursed`）的票据不能加入任何报销包
+- 提交报销包时会校验所有票据状态和金额，任何变更都会导致提交失败
+- 提交成功后，包内所有票据一次性标记为 `reimbursed` 并记录状态历史
