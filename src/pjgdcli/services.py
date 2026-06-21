@@ -9,6 +9,11 @@ STATUS_REIMBURSED = "reimbursed"
 STATUS_UNREIMBURSED = "unreimbursed"
 VALID_STATUSES = {STATUS_REIMBURSED, STATUS_UNREIMBURSED}
 
+PACKAGE_STATUS_PENDING = "pending"
+PACKAGE_STATUS_SUBMITTED = "submitted"
+PACKAGE_STATUS_CANCELLED = "cancelled"
+VALID_PACKAGE_STATUSES = {PACKAGE_STATUS_PENDING, PACKAGE_STATUS_SUBMITTED, PACKAGE_STATUS_CANCELLED}
+
 
 def _now():
     return datetime.now().isoformat(timespec="seconds")
@@ -421,3 +426,255 @@ def list_import_batches(only_failed: bool = False) -> List[Dict]:
             else:
                 batch["failures"] = []
         return batches
+
+
+def _get_receipts_in_pending_packages() -> set:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT pr.receipt_id
+            FROM package_receipts pr
+            JOIN reimbursement_packages rp ON pr.package_id = rp.id
+            WHERE rp.status = ?
+            """,
+            (PACKAGE_STATUS_PENDING,),
+        ).fetchall()
+        return {row["receipt_id"] for row in rows}
+
+
+def create_package(
+    name: str,
+    description: Optional[str] = None,
+    project: Optional[str] = None,
+    month: Optional[str] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+    tags: Optional[List[str]] = None,
+) -> Dict:
+    available_receipts = list_receipts(
+        project=project,
+        month=month,
+        min_amount=min_amount,
+        max_amount=max_amount,
+        tags=tags,
+        status=STATUS_UNREIMBURSED,
+    )
+
+    pending_receipt_ids = _get_receipts_in_pending_packages()
+    filtered_receipts = [r for r in available_receipts if r["id"] not in pending_receipt_ids]
+
+    if not filtered_receipts:
+        raise ValueError("没有符合条件的未报销票据可加入报销包")
+
+    total_amount = sum(r["amount"] for r in filtered_receipts)
+    all_tags = set()
+    for r in filtered_receipts:
+        all_tags.update(r.get("tags", []))
+    tags_str = ";".join(sorted(all_tags)) if all_tags else None
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO reimbursement_packages (name, description, total_amount, tags, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (name, description, total_amount, tags_str, PACKAGE_STATUS_PENDING, _now(), _now()),
+        )
+        package_id = cursor.lastrowid
+
+        for r in filtered_receipts:
+            receipt_tags = ";".join(r.get("tags", []))
+            cursor.execute(
+                """
+                INSERT INTO package_receipts (package_id, receipt_id, invoice_number, amount, date, project, description, tags)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (package_id, r["id"], r["invoice_number"], r["amount"], r["date"], r["project"], r.get("description"), receipt_tags),
+            )
+
+    return get_package(package_id)
+
+
+def get_package(package_id: int) -> Optional[Dict]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM reimbursement_packages WHERE id = ?",
+            (package_id,),
+        ).fetchone()
+        if not row:
+            return None
+        pkg = dict(row)
+        receipt_rows = conn.execute(
+            "SELECT * FROM package_receipts WHERE package_id = ? ORDER BY date DESC, id",
+            (package_id,),
+        ).fetchall()
+        pkg["receipts"] = [dict(r) for r in receipt_rows]
+        for r in pkg["receipts"]:
+            r["tags"] = [t for t in (r.get("tags") or "").split(";") if t]
+        pkg["tags"] = [t for t in (pkg.get("tags") or "").split(";") if t]
+        return pkg
+
+
+def list_packages(status: Optional[str] = None) -> List[Dict]:
+    with get_connection() as conn:
+        query = "SELECT * FROM reimbursement_packages"
+        params = []
+        if status:
+            query += " WHERE status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+        packages = [dict(row) for row in rows]
+        for pkg in packages:
+            pkg["tags"] = [t for t in (pkg.get("tags") or "").split(";") if t]
+            count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM package_receipts WHERE package_id = ?",
+                (pkg["id"],),
+            ).fetchone()
+            pkg["receipt_count"] = count["cnt"] if count else 0
+        return packages
+
+
+def _validate_package_for_submission(package_id: int, conn=None) -> Dict:
+    if conn is None:
+        pkg = get_package(package_id)
+    else:
+        row = conn.execute(
+            "SELECT * FROM reimbursement_packages WHERE id = ?",
+            (package_id,),
+        ).fetchone()
+        if not row:
+            pkg = None
+        else:
+            pkg = dict(row)
+            receipt_rows = conn.execute(
+                "SELECT * FROM package_receipts WHERE package_id = ? ORDER BY date DESC, id",
+                (package_id,),
+            ).fetchall()
+            pkg["receipts"] = [dict(r) for r in receipt_rows]
+            for r in pkg["receipts"]:
+                r["tags"] = [t for t in (r.get("tags") or "").split(";") if t]
+            pkg["tags"] = [t for t in (pkg.get("tags") or "").split(";") if t]
+
+    if not pkg:
+        raise ValueError(f"报销包 ID={package_id} 不存在")
+
+    if pkg["status"] == PACKAGE_STATUS_SUBMITTED:
+        raise ValueError(f"报销包 ID={package_id} 已提交，不能重复提交")
+
+    if pkg["status"] == PACKAGE_STATUS_CANCELLED:
+        raise ValueError(f"报销包 ID={package_id} 已取消，不能提交")
+
+    if not pkg["receipts"]:
+        raise ValueError(f"报销包 ID={package_id} 为空，不能提交")
+
+    for pr in pkg["receipts"]:
+        if conn is None:
+            receipt = get_receipt_by_id(pr["receipt_id"])
+        else:
+            row = conn.execute(
+                "SELECT * FROM receipts WHERE id = ?", (pr["receipt_id"],)
+            ).fetchone()
+            receipt = dict(row) if row else None
+
+        if not receipt:
+            raise ValueError(f"票据 ID={pr['receipt_id']} (发票号={pr['invoice_number']}) 已不存在")
+        if receipt["status"] != STATUS_UNREIMBURSED:
+            status_text = "已报销" if receipt["status"] == STATUS_REIMBURSED else receipt["status"]
+            raise ValueError(f"票据 ID={pr['receipt_id']} (发票号={pr['invoice_number']}) 状态已变更为 {status_text}，不能提交")
+        if pr["amount"] != receipt["amount"]:
+            raise ValueError(f"票据 ID={pr['receipt_id']} (发票号={pr['invoice_number']}) 金额已变更 (快照={pr['amount']:.2f}, 当前={receipt['amount']:.2f})，不能提交")
+
+    return pkg
+
+
+def submit_package(package_id: int) -> Dict:
+    with get_connection() as conn:
+        pkg = _validate_package_for_submission(package_id, conn)
+
+        for pr in pkg["receipts"]:
+            conn.execute(
+                "UPDATE receipts SET status = ?, updated_at = ? WHERE id = ?",
+                (STATUS_REIMBURSED, _now(), pr["receipt_id"]),
+            )
+            conn.execute(
+                """
+                INSERT INTO status_history (receipt_id, old_status, new_status, changed_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (pr["receipt_id"], STATUS_UNREIMBURSED, STATUS_REIMBURSED, _now()),
+            )
+
+        conn.execute(
+            """
+            UPDATE reimbursement_packages
+            SET status = ?, updated_at = ?, submitted_at = ?
+            WHERE id = ?
+            """,
+            (PACKAGE_STATUS_SUBMITTED, _now(), _now(), package_id),
+        )
+
+    return get_package(package_id)
+
+
+def cancel_package(package_id: int) -> Dict:
+    pkg = get_package(package_id)
+    if not pkg:
+        raise ValueError(f"报销包 ID={package_id} 不存在")
+
+    if pkg["status"] == PACKAGE_STATUS_SUBMITTED:
+        raise ValueError(f"报销包 ID={package_id} 已提交，不能取消")
+
+    if pkg["status"] == PACKAGE_STATUS_CANCELLED:
+        raise ValueError(f"报销包 ID={package_id} 已取消")
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE reimbursement_packages
+            SET status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (PACKAGE_STATUS_CANCELLED, _now(), package_id),
+        )
+
+    return get_package(package_id)
+
+
+def export_package_csv(package_id: int, output_path: str) -> str:
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir and not os.path.isdir(output_dir):
+        raise ValueError(f"导出目录不存在: {output_dir}")
+    if output_dir and not os.access(output_dir, os.W_OK):
+        raise ValueError(f"导出目录不可写: {output_dir}")
+
+    pkg = get_package(package_id)
+    if not pkg:
+        raise ValueError(f"报销包 ID={package_id} 不存在")
+
+    if not pkg["receipts"]:
+        raise ValueError(f"报销包 ID={package_id} 为空，无法导出")
+
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["包ID", "包名称", "包状态", "发票号", "金额", "日期", "项目", "备注", "标签"])
+        status_text = {
+            PACKAGE_STATUS_PENDING: "待提交",
+            PACKAGE_STATUS_SUBMITTED: "已提交",
+            PACKAGE_STATUS_CANCELLED: "已取消",
+        }.get(pkg["status"], pkg["status"])
+        for pr in pkg["receipts"]:
+            writer.writerow([
+                pkg["id"],
+                pkg["name"],
+                status_text,
+                pr["invoice_number"],
+                f"{pr['amount']:.2f}",
+                pr["date"],
+                pr["project"],
+                pr.get("description") or "",
+                ";".join(pr.get("tags", [])),
+            ])
+
+    return output_path

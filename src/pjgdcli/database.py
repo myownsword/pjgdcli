@@ -87,7 +87,36 @@ def init_db():
                 FOREIGN KEY (batch_id) REFERENCES import_batches(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS reimbursement_packages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT,
+                total_amount REAL NOT NULL DEFAULT 0,
+                tags TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                submitted_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS package_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                package_id INTEGER NOT NULL,
+                receipt_id INTEGER NOT NULL,
+                invoice_number TEXT NOT NULL,
+                amount REAL NOT NULL,
+                date TEXT NOT NULL,
+                project TEXT NOT NULL,
+                description TEXT,
+                tags TEXT,
+                FOREIGN KEY (package_id) REFERENCES reimbursement_packages(id) ON DELETE CASCADE,
+                FOREIGN KEY (receipt_id) REFERENCES receipts(id),
+                UNIQUE(package_id, receipt_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_receipts_project ON receipts(project);
             CREATE INDEX IF NOT EXISTS idx_receipts_date ON receipts(date);
             CREATE INDEX IF NOT EXISTS idx_receipts_status ON receipts(status);
+            CREATE INDEX IF NOT EXISTS idx_packages_status ON reimbursement_packages(status);
+            CREATE INDEX IF NOT EXISTS idx_package_receipts_receipt ON package_receipts(receipt_id);
         """)

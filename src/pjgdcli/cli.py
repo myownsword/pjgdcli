@@ -8,7 +8,7 @@ from rich.panel import Panel
 from rich.console import Group
 from rich import box
 
-from .database import init_db, get_db_path
+from .database import init_db, get_db_path, get_connection
 from . import services
 
 console = Console()
@@ -315,6 +315,232 @@ def batches_cmd(failed_only: bool):
             console.print(Panel(Group(info, "", fail_table), title=title, border_style=border_style))
         else:
             console.print(Panel(info, title=title, border_style=border_style))
+
+
+def _get_package_status_style(status: str) -> str:
+    return {
+        "pending": "bold yellow",
+        "submitted": "bold green",
+        "cancelled": "bold red",
+    }.get(status, "bold")
+
+
+def _get_package_status_text(status: str) -> str:
+    return {
+        "pending": "待提交",
+        "submitted": "已提交",
+        "cancelled": "已取消",
+    }.get(status, status)
+
+
+@main.group("package")
+def package_group():
+    """报销申请包管理
+
+    批量筛选未报销票据生成待提交包，支持查看、提交、取消和导出CSV。
+    已入待提交包或已报销的票据不能再加入其他待提交包。
+    """
+    pass
+
+
+@package_group.command("create")
+@click.option("--name", "-n", required=True, help="报销包名称")
+@click.option("--desc", "-m", default=None, help="报销包描述")
+@click.option("--project", "-p", default=None, help="按项目过滤")
+@click.option("--month", "-mth", default=None, help="按月份过滤 (YYYY-MM)")
+@click.option("--min-amount", "min_amount", type=float, default=None, help="最小金额")
+@click.option("--max-amount", "max_amount", type=float, default=None, help="最大金额")
+@click.option("--tag", "-t", "tags", multiple=True, help="按标签过滤（可多次指定）")
+def package_create_cmd(name: str, desc: Optional[str], project: Optional[str],
+                       month: Optional[str], min_amount: Optional[float],
+                       max_amount: Optional[float], tags: tuple):
+    """创建报销申请包（按条件筛选未报销票据）
+
+    示例:
+      pjgdcli package create -n "2026年6月差旅报销" -p 项目A -mth 2026-06 -t 差旅
+    """
+    try:
+        pkg = services.create_package(
+            name=name,
+            description=desc,
+            project=project,
+            month=month,
+            min_amount=min_amount,
+            max_amount=max_amount,
+            tags=list(tags) if tags else None,
+        )
+        console.print(f"[green]报销包创建成功！[/green] ID={pkg['id']}, 名称=[blue]{pkg['name']}[/blue]")
+        console.print(f"  票据数: [bold]{len(pkg['receipts'])}[/bold] 张 | 总金额: [bold green]¥{pkg['total_amount']:.2f}[/bold green]")
+        if pkg["tags"]:
+            console.print(f"  标签: [dim]{', '.join(pkg['tags'])}[/dim]")
+    except ValueError as e:
+        console.print(f"[red]创建失败: {e}[/red]")
+        sys.exit(1)
+
+
+@package_group.command("list")
+@click.option("--status", "-s", type=click.Choice(["pending", "submitted", "cancelled"]),
+              default=None, help="按状态过滤")
+def package_list_cmd(status: Optional[str]):
+    """列出所有报销包"""
+    packages = services.list_packages(status=status)
+    if not packages:
+        console.print("[yellow]暂无报销包[/yellow]")
+        return
+
+    table = Table(title="报销包列表", box=box.ROUNDED)
+    table.add_column("ID", justify="right", style="cyan", no_wrap=True)
+    table.add_column("名称", style="blue")
+    table.add_column("状态", style="bold")
+    table.add_column("票据数", justify="right", style="magenta")
+    table.add_column("总金额", justify="right", style="green")
+    table.add_column("标签", style="dim")
+    table.add_column("创建时间", style="white")
+    table.add_column("提交时间", style="white")
+
+    for pkg in packages:
+        status_style = _get_package_status_style(pkg["status"])
+        status_text = _get_package_status_text(pkg["status"])
+        tags = ", ".join(pkg.get("tags", []))
+        table.add_row(
+            str(pkg["id"]),
+            pkg["name"],
+            f"[{status_style}]{status_text}[/{status_style}]",
+            str(pkg["receipt_count"]),
+            f"¥{pkg['total_amount']:.2f}",
+            tags,
+            pkg["created_at"],
+            pkg.get("submitted_at") or "-",
+        )
+    console.print(table)
+
+
+@package_group.command("view")
+@click.argument("package_id", type=int)
+def package_view_cmd(package_id: int):
+    """查看报销包详情（含票据快照）"""
+    pkg = services.get_package(package_id)
+    if not pkg:
+        console.print(f"[red]报销包 ID={package_id} 不存在[/red]")
+        sys.exit(1)
+
+    status_style = _get_package_status_style(pkg["status"])
+    status_text = _get_package_status_text(pkg["status"])
+    tags = ", ".join(pkg.get("tags", []))
+
+    info = Panel(
+        f"名称: [bold blue]{pkg['name']}[/bold blue]\n"
+        f"状态: [{status_style}]{status_text}[/{status_style}]\n"
+        f"票据数: [bold]{len(pkg['receipts'])}[/bold] 张\n"
+        f"总金额: [bold green]¥{pkg['total_amount']:.2f}[/bold green]\n"
+        f"标签: [dim]{tags or '-'}[/dim]\n"
+        f"描述: [dim]{pkg.get('description') or '-'}[/dim]\n"
+        f"创建时间: {pkg['created_at']}\n"
+        f"更新时间: {pkg['updated_at']}\n"
+        f"提交时间: {pkg.get('submitted_at') or '-'}",
+        title=f"报销包 #{pkg['id']}",
+        border_style="blue",
+    )
+    console.print(info)
+
+    if pkg["receipts"]:
+        table = Table(title="包内票据快照", box=box.ROUNDED, show_lines=False)
+        table.add_column("票据ID", justify="right", style="cyan")
+        table.add_column("发票号", style="magenta")
+        table.add_column("金额", justify="right", style="green")
+        table.add_column("日期", style="blue")
+        table.add_column("项目", style="yellow")
+        table.add_column("标签", style="white")
+        table.add_column("备注", style="dim")
+
+        for pr in pkg["receipts"]:
+            pr_tags = ", ".join(pr.get("tags", []))
+            table.add_row(
+                str(pr["receipt_id"]),
+                pr["invoice_number"],
+                f"¥{pr['amount']:.2f}",
+                pr["date"],
+                pr["project"],
+                pr_tags,
+                pr.get("description") or "",
+            )
+        console.print(table)
+
+
+@package_group.command("submit")
+@click.argument("package_id", type=int)
+def package_submit_cmd(package_id: int):
+    """提交报销包（将包内所有票据标记为已报销）"""
+    try:
+        pkg = services.submit_package(package_id)
+        console.print(f"[green]报销包提交成功！[/green] ID={pkg['id']}, 名称=[blue]{pkg['name']}[/blue]")
+        console.print(f"  已将 [bold]{len(pkg['receipts'])}[/bold] 张票据标记为已报销，总金额: [bold green]¥{pkg['total_amount']:.2f}[/bold green]")
+    except ValueError as e:
+        console.print(f"[red]提交失败: {e}[/red]")
+        sys.exit(1)
+
+
+@package_group.command("cancel")
+@click.argument("package_id", type=int)
+def package_cancel_cmd(package_id: int):
+    """取消报销包（释放包内票据，可重新入包）"""
+    try:
+        pkg = services.cancel_package(package_id)
+        console.print(f"[green]报销包已取消[/green] ID={pkg['id']}, 名称=[blue]{pkg['name']}[/blue]")
+        console.print(f"  [dim]包内 {len(pkg['receipts'])} 张票据已释放，可重新加入其他报销包[/dim]")
+    except ValueError as e:
+        console.print(f"[red]取消失败: {e}[/red]")
+        sys.exit(1)
+
+
+@package_group.command("export")
+@click.argument("package_id", type=int)
+@click.option("--output", "-o", "output_path", required=True, type=click.Path(dir_okay=False),
+              help="输出CSV文件路径")
+def package_export_cmd(package_id: int, output_path: str):
+    """导出报销包为CSV文件"""
+    try:
+        result = services.export_package_csv(package_id, output_path)
+        console.print(f"[green]导出成功！[/green] 文件已保存至: [blue]{result}[/blue]")
+    except ValueError as e:
+        console.print(f"[red]导出失败: {e}[/red]")
+        sys.exit(1)
+
+
+@main.command("history")
+@click.argument("receipt_id", type=int)
+def history_cmd(receipt_id: int):
+    """查看票据状态变更历史"""
+    receipt = services.get_receipt_by_id(receipt_id)
+    if not receipt:
+        console.print(f"[red]票据 ID={receipt_id} 不存在[/red]")
+        sys.exit(1)
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM status_history
+            WHERE receipt_id = ? ORDER BY id ASC
+            """,
+            (receipt_id,),
+        ).fetchall()
+
+    console.print(f"[bold]票据 ID={receipt_id} (发票号: {receipt['invoice_number']}) 状态历史[/bold]")
+    if not rows:
+        console.print("[dim]暂无状态变更记录[/dim]")
+        return
+
+    table = Table(box=box.ROUNDED)
+    table.add_column("序号", justify="right", style="cyan")
+    table.add_column("原状态", style="red")
+    table.add_column("新状态", style="green")
+    table.add_column("变更时间", style="blue")
+
+    for i, row in enumerate(rows, 1):
+        old = "已报销" if row["old_status"] == "reimbursed" else "未报销"
+        new = "已报销" if row["new_status"] == "reimbursed" else "未报销"
+        table.add_row(str(i), old, new, row["changed_at"])
+    console.print(table)
 
 
 if __name__ == "__main__":
