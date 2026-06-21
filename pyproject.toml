@@ -1,0 +1,19 @@
+[project]
+name = "pjgdcli"
+version = "0.1.0"
+description = "本地票据归档 CLI 工具"
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.1.0",
+    "rich>=13.7.0",
+]
+
+[project.scripts]
+pjgdcli = "pjgdcli.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
