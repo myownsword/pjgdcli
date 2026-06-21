@@ -154,30 +154,27 @@ def undo_last_status_change(receipt_id: int) -> Optional[str]:
     with get_connection() as conn:
         row = conn.execute(
             """
-            SELECT old_status FROM status_history
+            SELECT id, old_status FROM status_history
             WHERE receipt_id = ? ORDER BY id DESC LIMIT 1
             """,
             (receipt_id,),
         ).fetchone()
         if not row:
             return None
+        history_id = row["id"]
         old_status = row["old_status"]
         current_row = conn.execute(
             "SELECT status FROM receipts WHERE id = ?", (receipt_id,)
         ).fetchone()
         if not current_row:
             return None
-        current_status = current_row["status"]
         conn.execute(
             "UPDATE receipts SET status = ?, updated_at = ? WHERE id = ?",
             (old_status, _now(), receipt_id),
         )
         conn.execute(
-            """
-            INSERT INTO status_history (receipt_id, old_status, new_status, changed_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (receipt_id, current_status, old_status, _now()),
+            "DELETE FROM status_history WHERE id = ?",
+            (history_id,),
         )
         return old_status
 
